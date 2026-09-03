@@ -1,0 +1,45 @@
+name: Build Windows App
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - custom-build
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build cc-switch.exe (Windows)
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup pnpm
+        run: |
+          corepack enable
+          corepack install
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Tauri App
+        run: pnpm tauri build --no-bundle
+
+      - name: Upload cc-switch.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc-switch-windows-x64
+          path: src-tauri/target/release/cc-switch.exe
+          if-no-files-found: error
