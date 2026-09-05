@@ -4594,6 +4594,22 @@ fn build_wt_cmd_fallback_args<'a>(wt_command: &'a str, bat_path: &'a str) -> Vec
     vec![wt_command, "new-tab", "cmd", "/K", bat_path]
 }
 
+/// `--appendCommandLine` shipped in Windows Terminal 1.19. Older builds reject
+/// the flag; `cmd /C start` cannot observe that failure, so fall back to cmd.
+#[cfg(any(target_os = "windows", test))]
+fn select_wt_launch_args<'a>(
+    shell: Option<WtDefaultShell>,
+    supports_append: bool,
+    wt_command: &'a str,
+    bat_path: &'a str,
+    ps_cmd: &'a str,
+) -> Vec<&'a str> {
+    match (shell, supports_append) {
+        (Some(shell), true) => shell.build_wt_args(wt_command, bat_path, ps_cmd),
+        _ => build_wt_cmd_fallback_args(wt_command, bat_path),
+    }
+}
+
 /// Strip braces and lowercase GUID strings so they compare across configs.
 #[cfg(any(target_os = "windows", test))]
 fn normalize_wt_guid(guid: &str) -> String {
@@ -4688,6 +4704,217 @@ fn split_wt_arguments(arguments: &str) -> Option<Vec<String>> {
     Some(result)
 }
 
+/// PowerShell host CLI option arity. Unique prefixes match; mixed-kind
+/// prefixes are treated as unknown so append is refused.
+/// `pwsh` and Windows PowerShell 5.1 differ only in `-Version`'s kind and in
+/// shell-specific parameters, so each shell keeps its own table.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PsHostOption {
+    Flag,
+    Value,
+    Terminal,
+}
+
+/// Official `pwsh` host aliases and parameter names from about_Pwsh plus the
+/// hidden `-ServerMode`. `-EncodedArguments`/`-ea` are omitted from about_Pwsh
+/// but accepted by pwsh 7.x as a valued host parameter that may precede
+/// `-Command`. Unlisted spellings stay conservative: unique long-name
+/// prefixes match, ambiguous ones refuse append (`classify_ps_host_option`).
+/// `-s`/`-se` are intentionally not listed — PowerShell resolves them to the
+/// hidden ServerMode, but the ambiguity rule below already refuses them.
+#[cfg(any(target_os = "windows", test))]
+const PWSH_HOST_ALIASES: &[(&str, PsHostOption)] = &[
+    ("?", PsHostOption::Terminal),
+    ("c", PsHostOption::Terminal),
+    ("command", PsHostOption::Terminal),
+    ("commandwithargs", PsHostOption::Terminal),
+    ("config", PsHostOption::Value),
+    ("configurationfile", PsHostOption::Value),
+    ("configurationname", PsHostOption::Value),
+    ("custompipename", PsHostOption::Value),
+    ("cwa", PsHostOption::Terminal),
+    ("e", PsHostOption::Terminal),
+    ("ea", PsHostOption::Value),
+    ("ec", PsHostOption::Terminal),
+    ("encodedarguments", PsHostOption::Value),
+    ("encodedcommand", PsHostOption::Terminal),
+    ("ep", PsHostOption::Value),
+    ("ex", PsHostOption::Value),
+    ("executionpolicy", PsHostOption::Value),
+    ("f", PsHostOption::Terminal),
+    ("file", PsHostOption::Terminal),
+    ("h", PsHostOption::Terminal),
+    ("help", PsHostOption::Terminal),
+    ("i", PsHostOption::Flag),
+    ("if", PsHostOption::Value),
+    ("inp", PsHostOption::Value),
+    ("inputformat", PsHostOption::Value),
+    ("interactive", PsHostOption::Flag),
+    ("l", PsHostOption::Flag),
+    ("login", PsHostOption::Flag),
+    ("mta", PsHostOption::Flag),
+    ("noe", PsHostOption::Flag),
+    ("noexit", PsHostOption::Flag),
+    ("nol", PsHostOption::Flag),
+    ("nologo", PsHostOption::Flag),
+    ("noni", PsHostOption::Flag),
+    ("noninteractive", PsHostOption::Flag),
+    ("nop", PsHostOption::Flag),
+    ("noprofile", PsHostOption::Flag),
+    ("noprofileloadtime", PsHostOption::Flag),
+    ("o", PsHostOption::Value),
+    ("of", PsHostOption::Value),
+    ("outputformat", PsHostOption::Value),
+    ("servermode", PsHostOption::Terminal),
+    ("settings", PsHostOption::Value),
+    ("settingsfile", PsHostOption::Value),
+    ("sshs", PsHostOption::Terminal),
+    ("sshservermode", PsHostOption::Terminal),
+    ("sta", PsHostOption::Flag),
+    ("v", PsHostOption::Terminal),
+    ("version", PsHostOption::Terminal),
+    ("w", PsHostOption::Value),
+    ("wd", PsHostOption::Value),
+    ("windowstyle", PsHostOption::Value),
+    ("wo", PsHostOption::Value),
+    ("workingdirectory", PsHostOption::Value),
+];
+
+/// Official `powershell.exe` 5.1 host aliases and parameter names plus the
+/// hidden `-ServerMode`. `-Version` takes `2.0`/`3.0`; it does not
+/// print-and-exit like `pwsh`, so it is a Value here. `-s`/`-se` are not
+/// listed: PowerShell 5.1 resolves them to the hidden ServerMode over `-Sta`,
+/// and the ambiguity rule refuses them regardless of which parameter wins.
+#[cfg(any(target_os = "windows", test))]
+const POWERSHELL_HOST_ALIASES: &[(&str, PsHostOption)] = &[
+    ("?", PsHostOption::Terminal),
+    ("c", PsHostOption::Terminal),
+    ("command", PsHostOption::Terminal),
+    ("config", PsHostOption::Value),
+    ("configurationname", PsHostOption::Value),
+    ("e", PsHostOption::Terminal),
+    ("ea", PsHostOption::Value),
+    ("ec", PsHostOption::Terminal),
+    ("encodedarguments", PsHostOption::Value),
+    ("encodedcommand", PsHostOption::Terminal),
+    ("ep", PsHostOption::Value),
+    ("ex", PsHostOption::Value),
+    ("executionpolicy", PsHostOption::Value),
+    ("f", PsHostOption::Terminal),
+    ("file", PsHostOption::Terminal),
+    ("h", PsHostOption::Terminal),
+    ("help", PsHostOption::Terminal),
+    ("if", PsHostOption::Value),
+    ("inp", PsHostOption::Value),
+    ("inputformat", PsHostOption::Value),
+    ("mta", PsHostOption::Flag),
+    ("noe", PsHostOption::Flag),
+    ("noexit", PsHostOption::Flag),
+    ("nol", PsHostOption::Flag),
+    ("nologo", PsHostOption::Flag),
+    ("noni", PsHostOption::Flag),
+    ("noninteractive", PsHostOption::Flag),
+    ("nop", PsHostOption::Flag),
+    ("noprofile", PsHostOption::Flag),
+    ("o", PsHostOption::Value),
+    ("of", PsHostOption::Value),
+    ("outputformat", PsHostOption::Value),
+    ("psconsolefile", PsHostOption::Value),
+    ("servermode", PsHostOption::Terminal),
+    ("sta", PsHostOption::Flag),
+    ("v", PsHostOption::Value),
+    ("version", PsHostOption::Value),
+    ("w", PsHostOption::Value),
+    ("wd", PsHostOption::Value),
+    ("windowstyle", PsHostOption::Value),
+    ("workingdirectory", PsHostOption::Value),
+];
+
+/// PowerShell host CLI option dashes: ASCII hyphen plus the Unicode dashes
+/// `pwsh`/`powershell.exe` accept (U+2013, U+2014, U+2015). Copied-from-docs
+/// commandlines often use these instead of ASCII `-`.
+#[cfg(any(target_os = "windows", test))]
+const PS_OPTION_DASHES: &[char] = &['-', '\u{2013}', '\u{2014}', '\u{2015}'];
+
+#[cfg(any(target_os = "windows", test))]
+fn ps_host_option_name(argument: &str) -> Option<&str> {
+    let mut chars = argument.chars();
+    let first = chars.next()?;
+    let rest = chars.as_str();
+    if first == '/' {
+        return (!rest.is_empty()).then_some(rest);
+    }
+    if !PS_OPTION_DASHES.contains(&first) {
+        return None;
+    }
+    // `--NoLogo` and `––NoLogo` (same dash twice) are long-option spellings.
+    // Mixed dashes (`-–NoLogo`) are not options; leave the second character.
+    let mut inner = rest.chars();
+    let rest = if inner.next() == Some(first) {
+        inner.as_str()
+    } else {
+        rest
+    };
+    (!rest.is_empty()).then_some(rest)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn classify_ps_host_option(shell: WtDefaultShell, name: &str) -> Option<PsHostOption> {
+    let options = match shell {
+        WtDefaultShell::Pwsh => PWSH_HOST_ALIASES,
+        WtDefaultShell::PowerShell => POWERSHELL_HOST_ALIASES,
+        WtDefaultShell::Cmd => return None,
+    };
+
+    let name = name.to_ascii_lowercase();
+    // 1. Exact alias or full parameter match wins immediately, avoiding
+    // ambiguous prefix conflicts (e.g. `pwsh -i` matching interactive vs inputformat).
+    if let Some((_, option)) = options.iter().find(|(alias, _)| *alias == name.as_str()) {
+        return Some(*option);
+    }
+
+    // 2. Otherwise match an unambiguous prefix of the full parameter names.
+    // A mixed-kind prefix (e.g. pwsh `-s` over sta/servermode/settingsfile)
+    // is treated as unknown so append is refused.
+    let mut kind = None;
+    for (parameter, option) in options {
+        if parameter.starts_with(&name) {
+            if kind.is_some_and(|existing| existing != *option) {
+                return None;
+            }
+            kind = Some(*option);
+        }
+    }
+    kind
+}
+
+/// Walk host arguments with arity. A leftover positional is implicit `-File`.
+#[cfg(any(target_os = "windows", test))]
+fn pwsh_host_args_block_append(shell: WtDefaultShell, arguments: &[String]) -> bool {
+    let mut index = 0usize;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == "--" {
+            return true;
+        }
+        let Some(name) = ps_host_option_name(argument) else {
+            return true;
+        };
+        match classify_ps_host_option(shell, name) {
+            Some(PsHostOption::Flag) => index += 1,
+            Some(PsHostOption::Value) => {
+                if index + 1 >= arguments.len() {
+                    return true;
+                }
+                index += 2;
+            }
+            Some(PsHostOption::Terminal) | None => return true,
+        }
+    }
+    false
+}
+
 /// Existing terminal-action flags consume or reject extra arguments, so
 /// `--appendCommandLine` must not be used.
 #[cfg(any(target_os = "windows", test))]
@@ -4696,37 +4923,15 @@ fn wt_commandline_has_terminal_action(shell: WtDefaultShell, arguments: &str) ->
         return true;
     };
 
-    arguments.iter().any(|argument| {
-        let option = argument.to_ascii_lowercase();
-        match shell {
-            WtDefaultShell::Pwsh | WtDefaultShell::PowerShell => {
-                let Some(name) = option
-                    .strip_prefix('-')
-                    .or_else(|| option.strip_prefix('/'))
-                else {
-                    return false;
-                };
-                !name.is_empty()
-                    && [
-                        "command",
-                        "commandwithargs",
-                        "encodedcommand",
-                        "file",
-                        "sshservermode",
-                        "sshs",
-                        "socketservermode",
-                        "namedpipeservermode",
-                        "servermode",
-                        "version",
-                        "help",
-                        "?",
-                    ]
-                    .iter()
-                    .any(|parameter| parameter.starts_with(name))
-            }
-            WtDefaultShell::Cmd => option.starts_with("/c") || option.starts_with("/k"),
+    match shell {
+        WtDefaultShell::Pwsh | WtDefaultShell::PowerShell => {
+            pwsh_host_args_block_append(shell, &arguments)
         }
-    })
+        WtDefaultShell::Cmd => arguments.iter().any(|argument| {
+            let option = argument.to_ascii_lowercase();
+            option.starts_with("/c") || option.starts_with("/k")
+        }),
+    }
 }
 
 /// Classify a supported shell from the executable name. An explicit commandline
@@ -5029,26 +5234,28 @@ fn normalized_wt_path(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-/// True when `path` is inside a Store Windows Terminal package under `WindowsApps`.
-/// `Some(true)` is Preview, `Some(false)` is stable. Directory-name substrings elsewhere
-/// (GitHub zip extracts) must not match.
+/// Walk `path` upward for the nearest Windows Terminal Store package under
+/// `WindowsApps`; returns whether it is Preview and the lowercased package
+/// directory name (which embeds the version). Directory-name substrings
+/// elsewhere (GitHub zip extracts) must not match.
 #[cfg(any(target_os = "windows", test))]
-fn packaged_wt_preview(path: &Path) -> Option<bool> {
+fn store_wt_package_dir(path: &Path) -> Option<(bool, String)> {
     path.ancestors().find_map(|directory| {
-        let parent = directory.parent()?;
-        let parent_name = parent.file_name()?.to_string_lossy();
-        if !parent_name.eq_ignore_ascii_case("WindowsApps") {
+        let parent_name = directory.parent()?.file_name()?;
+        if !parent_name
+            .to_string_lossy()
+            .eq_ignore_ascii_case("WindowsApps")
+        {
             return None;
         }
 
-        let package_name = directory
+        let package = directory
             .file_name()?
             .to_string_lossy()
             .to_ascii_lowercase();
-        if package_name.starts_with("microsoft.windowsterminalpreview_") {
-            Some(true)
-        } else if package_name.starts_with("microsoft.windowsterminal_") {
-            Some(false)
+        let preview = package.starts_with("microsoft.windowsterminalpreview_");
+        if preview || package.starts_with("microsoft.windowsterminal_") {
+            Some((preview, package))
         } else {
             None
         }
@@ -5079,6 +5286,50 @@ fn scoop_wt_install_context(exe_path: &Path) -> Option<(PathBuf, String)> {
     }
 
     Some((apps_dir.parent()?.to_path_buf(), package))
+}
+
+/// Parse `major.minor.patch.revision` so Store package folders and Scoop
+/// versioned app directories can be compared against WT 1.19.
+#[cfg(any(target_os = "windows", test))]
+fn parse_wt_dotted_version(value: &str) -> Option<(u16, u16, u16, u16)> {
+    let mut parts = value.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    let revision = parts.next()?.parse().ok()?;
+    parts
+        .next()
+        .is_none()
+        .then_some((major, minor, patch, revision))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn wt_version_supports_append(version: (u16, u16, u16, u16)) -> bool {
+    (version.0, version.1) >= (1, 19)
+}
+
+/// Store package folders and Scoop versioned directories embed the WT version.
+/// `current` shims and unpackaged layouts have to use the PE version instead.
+#[cfg(any(target_os = "windows", test))]
+fn wt_version_from_path(path: &Path) -> Option<(u16, u16, u16, u16)> {
+    if let Some((_, package)) = store_wt_package_dir(path) {
+        let rest = package
+            .strip_prefix("microsoft.windowsterminalpreview_")
+            .or_else(|| package.strip_prefix("microsoft.windowsterminal_"))?;
+        return parse_wt_dotted_version(rest.split('_').next()?);
+    }
+
+    // Scoop layout: `<root>/apps/<package>/<version>/…`; `current` is a shim
+    // whose version lives in the PE, not the directory name.
+    let (root, package) = scoop_wt_install_context(path)?;
+    let mut segments = path.strip_prefix(root.join("apps")).ok()?.components();
+    let _package_segment = segments.next()?;
+    debug_assert_eq!(_package_segment.as_os_str(), package.as_str());
+    let version = segments.next()?.as_os_str().to_string_lossy();
+    if version.eq_ignore_ascii_case("current") {
+        return None;
+    }
+    parse_wt_dotted_version(&version)
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -5121,6 +5372,8 @@ fn is_wt_portable_install(exe_path: &Path) -> bool {
 
 /// Return settings paths for the resolved executable so leftover configs from
 /// other installs cannot participate in mtime ranking.
+/// Sibling and Scoop persist paths are only live while `.portable` exists;
+/// otherwise WT reads `%LOCALAPPDATA%\Microsoft\Windows Terminal`.
 #[cfg(any(target_os = "windows", test))]
 fn build_wt_settings_paths(
     settings_executable: &Path,
@@ -5128,21 +5381,23 @@ fn build_wt_settings_paths(
 ) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    if let Some(dir) = settings_executable.parent() {
-        push_unique_path(&mut paths, dir.join("settings").join("settings.json"));
-        push_unique_path(&mut paths, dir.join("settings.json"));
+    if is_wt_portable_install(settings_executable) {
+        if let Some(dir) = settings_executable.parent() {
+            push_unique_path(&mut paths, dir.join("settings").join("settings.json"));
+            push_unique_path(&mut paths, dir.join("settings.json"));
+        }
+        if let Some((root, package)) = scoop_wt_install_context(settings_executable) {
+            append_scoop_wt_settings_paths(&mut paths, &root, &package);
+        }
+        return paths;
     }
 
-    if let Some((root, package)) = scoop_wt_install_context(settings_executable) {
-        append_scoop_wt_settings_paths(&mut paths, &root, &package);
-    } else if let Some(preview) = packaged_wt_preview(settings_executable) {
+    if let Some((preview, _)) = store_wt_package_dir(settings_executable) {
         if let Some(local) = local_appdata {
             push_unique_path(&mut paths, store_wt_settings_path(local, preview));
         }
-    } else if !is_wt_portable_install(settings_executable) {
-        if let Some(local) = local_appdata {
-            push_unique_path(&mut paths, unpackaged_wt_settings_path(local));
-        }
+    } else if let Some(local) = local_appdata {
+        push_unique_path(&mut paths, unpackaged_wt_settings_path(local));
     }
 
     paths
@@ -5216,8 +5471,86 @@ fn detect_wt_default_shell(installation: &ResolvedWtInstallation) -> Option<WtDe
     shell
 }
 
+#[cfg(target_os = "windows")]
+fn wt_file_version(path: &Path) -> Option<(u16, u16, u16, u16)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut dummy = 0u32;
+    // SAFETY: `wide` is a local NUL-terminated path buffer.
+    let size = unsafe { GetFileVersionInfoSizeW(wide.as_ptr(), &mut dummy) };
+    if size == 0 {
+        return None;
+    }
+
+    let mut buffer = vec![0u8; size as usize];
+    // SAFETY: `buffer` is writable for `size` bytes returned above.
+    let ok = unsafe { GetFileVersionInfoW(wide.as_ptr(), 0, size, buffer.as_mut_ptr().cast()) };
+    if ok == 0 {
+        return None;
+    }
+
+    let mut info: *mut core::ffi::c_void = core::ptr::null_mut();
+    let mut info_len = 0u32;
+    let subblock: Vec<u16> = "\\\0".encode_utf16().collect();
+    // SAFETY: `buffer` still owns the version block; `info`/`info_len` are out params.
+    let ok = unsafe {
+        VerQueryValueW(
+            buffer.as_ptr().cast(),
+            subblock.as_ptr(),
+            &mut info,
+            &mut info_len,
+        )
+    };
+    if ok == 0 || info.is_null() || (info_len as usize) < 16 {
+        return None;
+    }
+
+    // VS_FIXEDFILEINFO: signature, struct version, then fileVersionMS/LS.
+    let bytes = unsafe { std::slice::from_raw_parts(info as *const u8, info_len as usize) };
+    let ms = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?);
+    let ls = u32::from_le_bytes(bytes.get(12..16)?.try_into().ok()?);
+    Some((
+        (ms >> 16) as u16,
+        (ms & 0xffff) as u16,
+        (ls >> 16) as u16,
+        (ls & 0xffff) as u16,
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn wt_version_from_executable(path: &Path) -> Option<(u16, u16, u16, u16)> {
+    wt_version_from_path(path)
+        .or_else(|| wt_file_version(path))
+        .or_else(|| {
+            let sibling = path.parent()?.join("WindowsTerminal.exe");
+            if sibling == path || !sibling.is_file() {
+                None
+            } else {
+                wt_file_version(&sibling)
+            }
+        })
+}
+
+/// No observable version (path or PE) means "do not false-negative": assume
+/// append support. WT help text is not a reliable capability probe, since the
+/// GUI `wt` often writes nothing to captured stdout/stderr.
+#[cfg(target_os = "windows")]
+fn wt_installation_supports_append(installation: &ResolvedWtInstallation) -> bool {
+    installation
+        .settings_executable
+        .as_deref()
+        .and_then(wt_version_from_executable)
+        .or_else(|| wt_version_from_executable(&installation.launcher))
+        .is_none_or(wt_version_supports_append)
+}
+
 /// Launch the same resolved Windows Terminal, and fall back to an explicit cmd
-/// tab when the default profile cannot be recognized safely.
+/// tab when the default profile cannot be recognized safely or WT is too old
+/// for `--appendCommandLine`.
 #[cfg(target_os = "windows")]
 fn launch_wt_terminal(bat_path: &str, ps_cmd: &str) -> Result<(), String> {
     let installation = resolve_wt_installation();
@@ -5226,10 +5559,10 @@ fn launch_wt_terminal(bat_path: &str, ps_cmd: &str) -> Result<(), String> {
         .map(|installation| installation.launcher.to_string_lossy().into_owned())
         .unwrap_or_else(|| "wt".to_string());
     let shell = installation.as_ref().and_then(detect_wt_default_shell);
-    let args = match shell {
-        Some(shell) => shell.build_wt_args(&wt_command, bat_path, ps_cmd),
-        None => build_wt_cmd_fallback_args(&wt_command, bat_path),
-    };
+    let supports_append = installation
+        .as_ref()
+        .is_some_and(wt_installation_supports_append);
+    let args = select_wt_launch_args(shell, supports_append, &wt_command, bat_path, ps_cmd);
     run_windows_start_command(&args, "Windows Terminal")
 }
 
@@ -7999,33 +8332,107 @@ mod tests {
             }
         }"#;
         assert_eq!(parse_wt_default_shell(overridden_builtin), None);
-        assert_eq!(
-            classify_wt_commandline(r#"pwsh.exe -NoLogo -Fil "C:\init.ps1""#),
-            None
-        );
-        assert_eq!(
-            classify_wt_commandline(r#"cmd.exe /D /K C:\init.cmd"#),
-            None
-        );
-        assert_eq!(classify_wt_commandline(r#"cmd.exe /cdir"#), None);
-        assert_eq!(classify_wt_commandline(r#"pwsh.exe -SSHServerMode"#), None);
-        assert_eq!(
-            classify_wt_commandline(
-                r#"pwsh.exe -WorkingDirectory "C:\Work\My -File Project" -NoLogo"#
-            ),
-            Some(WtDefaultShell::Pwsh)
-        );
-        assert_eq!(
-            classify_wt_commandline(r#"pwsh.exe -WorkingDirectory "C:\missing"#),
-            None
-        );
-        assert_eq!(
-            classify_wt_commandline(r#""C:\missing quote\pwsh.exe"#),
-            None
-        );
-
         assert_eq!(parse_wt_default_shell("not valid json"), None);
         assert_eq!(parse_wt_default_shell(r#"{"defaultProfile": ""}"#), None);
+    }
+
+    /// Server mode runs the remoting protocol and ignores `-Command`; leftover
+    /// positionals mean implicit `-File`. Append must be refused for all of
+    /// these, including the ServerMode prefixes `-s`/`-se` that PowerShell
+    /// resolves over `-Sta`/`-SettingsFile`.
+    #[test]
+    fn wt_commandline_classification_accepts_safe_and_refuses_unsafe() {
+        let refused: &[&str] = &[
+            r#"pwsh.exe -NoLogo -Fil "C:\init.ps1""#,
+            r#"cmd.exe /D /K C:\init.cmd"#,
+            r#"cmd.exe /cdir"#,
+            r#"pwsh.exe -SSHServerMode"#,
+            r#"pwsh.exe -s -NoProfile"#,
+            r#"pwsh.exe -se -NoProfile"#,
+            r#"pwsh.exe -ServerMode"#,
+            r#"powershell.exe -s -NoProfile"#,
+            r#"powershell.exe -se -NoProfile"#,
+            r#"powershell.exe -ServerMode"#,
+            r#"pwsh.exe C:\init.ps1"#,
+            r#"pwsh.exe -f C:\init.ps1"#,
+            r#"powershell.exe -c Get-Date"#,
+            r#"pwsh.exe -Version"#,
+            r#"powershell.exe -Version"#,
+            r#"pwsh.exe -WorkingDirectory "C:\missing"#,
+        ];
+        for cmdline in refused {
+            assert_eq!(classify_wt_commandline(cmdline), None, "{cmdline}");
+        }
+
+        let accepted: &[(&str, WtDefaultShell)] = &[
+            (r#"pwsh.exe -EncodedArguments ABC="#, WtDefaultShell::Pwsh),
+            (r#"pwsh.exe -ea ABC="#, WtDefaultShell::Pwsh),
+            (r#"pwsh.exe -encodeda ABC="#, WtDefaultShell::Pwsh),
+            (
+                r#"powershell.exe -EncodedArguments ABC="#,
+                WtDefaultShell::PowerShell,
+            ),
+            (r#"pwsh.exe -Login -NoLogo"#, WtDefaultShell::Pwsh),
+            (
+                r#"pwsh.exe -Interactive -NoProfileLoadTime"#,
+                WtDefaultShell::Pwsh,
+            ),
+            (
+                r#"pwsh.exe -SettingsFile C:\x.json -NoLogo"#,
+                WtDefaultShell::Pwsh,
+            ),
+            (r#"pwsh.exe -wd C:\Work -nol"#, WtDefaultShell::Pwsh),
+            (r#"pwsh.exe -i"#, WtDefaultShell::Pwsh),
+            (r#"powershell.exe -ep Bypass"#, WtDefaultShell::PowerShell),
+            (
+                r#"powershell.exe -if Text -of Text"#,
+                WtDefaultShell::PowerShell,
+            ),
+            (r#"powershell.exe -ea ABC="#, WtDefaultShell::PowerShell),
+            (
+                r#"pwsh.exe -ConfigurationFile C:\x.pssc"#,
+                WtDefaultShell::Pwsh,
+            ),
+            (
+                r#"powershell.exe -Version 2.0 -NoLogo"#,
+                WtDefaultShell::PowerShell,
+            ),
+            (r#"pwsh.exe -NoLogo -NoExit"#, WtDefaultShell::Pwsh),
+            (
+                r#"pwsh.exe -WorkingDirectory "C:\Work\My -File Project" -NoLogo"#,
+                WtDefaultShell::Pwsh,
+            ),
+            // Quoted executable with a space and no arguments appends safely.
+            (r#""C:\missing quote\pwsh.exe""#, WtDefaultShell::Pwsh),
+        ];
+        for (cmdline, expected) in accepted {
+            assert_eq!(
+                classify_wt_commandline(cmdline),
+                Some(*expected),
+                "{cmdline}"
+            );
+        }
+
+        // Copied-from-docs Unicode dashes (U+2013/2014/2015) and their
+        // doubled long-option spelling parse like ASCII `-`.
+        for dash in ['\u{2013}', '\u{2014}', '\u{2015}'] {
+            let doubled = format!("pwsh.exe {dash}{dash}NoLogo");
+            assert_eq!(
+                classify_wt_commandline(&format!("pwsh.exe {dash}NoLogo")),
+                Some(WtDefaultShell::Pwsh),
+                "dash {dash:?}"
+            );
+            assert_eq!(
+                classify_wt_commandline(&doubled),
+                Some(WtDefaultShell::Pwsh),
+                "doubled dash {dash:?}"
+            );
+            assert_eq!(
+                classify_wt_commandline(&format!("powershell.exe {dash}NoLogo")),
+                Some(WtDefaultShell::PowerShell),
+                "dash {dash:?}"
+            );
+        }
     }
 
     #[test]
@@ -8132,6 +8539,18 @@ mod tests {
             build_wt_cmd_fallback_args(wt, bat),
             vec![wt, "new-tab", "cmd", "/K", bat]
         );
+        assert_eq!(
+            select_wt_launch_args(Some(WtDefaultShell::Pwsh), true, wt, bat, ps),
+            WtDefaultShell::Pwsh.build_wt_args(wt, bat, ps)
+        );
+        assert_eq!(
+            select_wt_launch_args(Some(WtDefaultShell::Pwsh), false, wt, bat, ps),
+            build_wt_cmd_fallback_args(wt, bat)
+        );
+        assert_eq!(
+            select_wt_launch_args(None, true, wt, bat, ps),
+            build_wt_cmd_fallback_args(wt, bat)
+        );
 
         let shim = "path = \"C:\\scoop\\apps\\windows-terminal\\current\\wt.exe\"\r\nargs = \r\n";
         assert_eq!(
@@ -8149,19 +8568,18 @@ mod tests {
         let scoop_exe =
             Path::new("C:/Users/test/scoop/apps/windows-terminal/current/WindowsTerminal.exe");
         let scoop = build_wt_settings_paths(scoop_exe, Some(local));
-        assert_eq!(
-            scoop[0],
-            scoop_exe.parent().unwrap().join("settings/settings.json")
-        );
-        assert_eq!(
-            scoop[2],
-            Path::new("C:/Users/test/scoop")
-                .join("persist/windows-terminal/settings/settings.json")
-        );
+        assert_eq!(scoop, vec![unpackaged_wt_settings_path(local)]);
 
         let unpackaged_exe = Path::new("C:/Program Files/Windows Terminal/wt.exe");
         let unpackaged = build_wt_settings_paths(unpackaged_exe, Some(local));
-        assert!(unpackaged.contains(&unpackaged_wt_settings_path(local)));
+        assert_eq!(unpackaged, vec![unpackaged_wt_settings_path(local)]);
+        assert!(!unpackaged.contains(
+            &unpackaged_exe
+                .parent()
+                .unwrap()
+                .join("settings")
+                .join("settings.json")
+        ));
 
         let store_exe = Path::new(
             "C:/Program Files/WindowsApps/Microsoft.WindowsTerminal_1.24.11911.0_x64__8wekyb3d8bbwe/wt.exe",
@@ -8198,8 +8616,60 @@ mod tests {
         let local = Path::new("C:/Users/test/AppData/Local");
         let arbitrary = Path::new("C:/Tools/terminal/wt.exe");
         let paths = build_wt_settings_paths(arbitrary, Some(local));
-        assert!(paths.contains(&unpackaged_wt_settings_path(local)));
+        assert_eq!(paths, vec![unpackaged_wt_settings_path(local)]);
         assert!(!paths.contains(&store_wt_settings_path(local, false)));
+        assert!(!paths.contains(&PathBuf::from("C:/Tools/terminal/settings/settings.json")));
+    }
+
+    #[test]
+    fn scoop_portable_wt_uses_persist_not_localappdata() {
+        let temp = tempfile::tempdir().expect("temp dir should be created");
+        let exe_dir = temp.path().join("scoop/apps/windows-terminal/current");
+        std::fs::create_dir_all(&exe_dir).expect("scoop app dir should be created");
+        let exe = exe_dir.join("wt.exe");
+        std::fs::write(&exe, b"").expect("scoop exe placeholder should be written");
+        std::fs::write(exe_dir.join(".portable"), b"").expect("portable marker should be written");
+
+        let local = Path::new("C:/Users/test/AppData/Local");
+        let paths = build_wt_settings_paths(&exe, Some(local));
+        assert!(paths.contains(&exe_dir.join("settings").join("settings.json")));
+        assert!(paths.contains(
+            &temp
+                .path()
+                .join("scoop/persist/windows-terminal/settings/settings.json")
+        ));
+        assert!(!paths.contains(&unpackaged_wt_settings_path(local)));
+    }
+
+    #[test]
+    fn wt_version_and_path_detect_append_command_line_support() {
+        assert!(!wt_version_supports_append((1, 18, 3181, 0)));
+        assert!(wt_version_supports_append((1, 19, 0, 0)));
+        assert!(wt_version_supports_append((1, 24, 11911, 0)));
+        assert_eq!(
+            wt_version_from_path(Path::new(
+                "C:/Program Files/WindowsApps/Microsoft.WindowsTerminal_1.18.3181.0_x64__8wekyb3d8bbwe/wt.exe"
+            )),
+            Some((1, 18, 3181, 0))
+        );
+        assert_eq!(
+            wt_version_from_path(Path::new(
+                "C:/Program Files/WindowsApps/Microsoft.WindowsTerminal_1.24.11911.0_x64__8wekyb3d8bbwe/wt.exe"
+            )),
+            Some((1, 24, 11911, 0))
+        );
+        assert_eq!(
+            wt_version_from_path(Path::new(
+                "C:/Users/test/scoop/apps/windows-terminal/1.18.3181.0/wt.exe"
+            )),
+            Some((1, 18, 3181, 0))
+        );
+        assert_eq!(
+            wt_version_from_path(Path::new(
+                "C:/Users/test/scoop/apps/windows-terminal/current/wt.exe"
+            )),
+            None
+        );
     }
 
     #[test]
@@ -8259,7 +8729,7 @@ mod tests {
             "resolved target should be the Store package executable, got {target:?}"
         );
         assert_eq!(
-            packaged_wt_preview(&target),
+            store_wt_package_dir(&target).map(|(preview, _)| preview),
             Some(false),
             "stable Store install should not be classified as Preview: {target:?}"
         );
