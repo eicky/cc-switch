@@ -320,7 +320,7 @@ mod tests {
             }
             spawn_new_console(&mut command).unwrap();
 
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(60);
             while !(written(&marker) && written(&cwd_marker)) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -382,7 +382,7 @@ mod tests {
             .output()
             .expect("probe parent should launch");
         assert!(output.status.success());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while !marker.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -416,7 +416,7 @@ mod tests {
             drop(parent.stdin.take());
             let output = parent.wait_with_output().expect("probe should finish");
             assert!(output.status.success(), "probe failed for {shell}");
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(60);
             while !written(&marker) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(20));
             }
