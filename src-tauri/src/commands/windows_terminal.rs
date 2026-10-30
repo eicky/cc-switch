@@ -19,14 +19,56 @@ use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const BATCH_PATH_ENV: &str = "CC_SWITCH_INTERNAL_BATCH_PATH";
 const CWD_ENV: &str = "CC_SWITCH_INTERNAL_CWD";
-/// Carry a launch's arguments, cleanup paths and non-ASCII variable values.
-const VALUE_ENV_VARS: [&str; 6] = [
+/// Room for 24 Codex overrides, 16 user args, flags, cleanup and non-ASCII env.
+const VALUE_ENV_VARS: [&str; 48] = [
     "CC_SWITCH_INTERNAL_VALUE_0",
     "CC_SWITCH_INTERNAL_VALUE_1",
     "CC_SWITCH_INTERNAL_VALUE_2",
     "CC_SWITCH_INTERNAL_VALUE_3",
     "CC_SWITCH_INTERNAL_VALUE_4",
     "CC_SWITCH_INTERNAL_VALUE_5",
+    "CC_SWITCH_INTERNAL_VALUE_6",
+    "CC_SWITCH_INTERNAL_VALUE_7",
+    "CC_SWITCH_INTERNAL_VALUE_8",
+    "CC_SWITCH_INTERNAL_VALUE_9",
+    "CC_SWITCH_INTERNAL_VALUE_10",
+    "CC_SWITCH_INTERNAL_VALUE_11",
+    "CC_SWITCH_INTERNAL_VALUE_12",
+    "CC_SWITCH_INTERNAL_VALUE_13",
+    "CC_SWITCH_INTERNAL_VALUE_14",
+    "CC_SWITCH_INTERNAL_VALUE_15",
+    "CC_SWITCH_INTERNAL_VALUE_16",
+    "CC_SWITCH_INTERNAL_VALUE_17",
+    "CC_SWITCH_INTERNAL_VALUE_18",
+    "CC_SWITCH_INTERNAL_VALUE_19",
+    "CC_SWITCH_INTERNAL_VALUE_20",
+    "CC_SWITCH_INTERNAL_VALUE_21",
+    "CC_SWITCH_INTERNAL_VALUE_22",
+    "CC_SWITCH_INTERNAL_VALUE_23",
+    "CC_SWITCH_INTERNAL_VALUE_24",
+    "CC_SWITCH_INTERNAL_VALUE_25",
+    "CC_SWITCH_INTERNAL_VALUE_26",
+    "CC_SWITCH_INTERNAL_VALUE_27",
+    "CC_SWITCH_INTERNAL_VALUE_28",
+    "CC_SWITCH_INTERNAL_VALUE_29",
+    "CC_SWITCH_INTERNAL_VALUE_30",
+    "CC_SWITCH_INTERNAL_VALUE_31",
+    "CC_SWITCH_INTERNAL_VALUE_32",
+    "CC_SWITCH_INTERNAL_VALUE_33",
+    "CC_SWITCH_INTERNAL_VALUE_34",
+    "CC_SWITCH_INTERNAL_VALUE_35",
+    "CC_SWITCH_INTERNAL_VALUE_36",
+    "CC_SWITCH_INTERNAL_VALUE_37",
+    "CC_SWITCH_INTERNAL_VALUE_38",
+    "CC_SWITCH_INTERNAL_VALUE_39",
+    "CC_SWITCH_INTERNAL_VALUE_40",
+    "CC_SWITCH_INTERNAL_VALUE_41",
+    "CC_SWITCH_INTERNAL_VALUE_42",
+    "CC_SWITCH_INTERNAL_VALUE_43",
+    "CC_SWITCH_INTERNAL_VALUE_44",
+    "CC_SWITCH_INTERNAL_VALUE_45",
+    "CC_SWITCH_INTERNAL_VALUE_46",
+    "CC_SWITCH_INTERNAL_VALUE_47",
 ];
 
 fn private_env_vars() -> impl Iterator<Item = &'static str> {
@@ -126,7 +168,10 @@ fn provider_batch(launch: &ProviderLaunch, values: &mut Vec<OsString>) -> Result
         if argument.is_empty() {
             command.push_str(" \"\"");
         } else {
-            let name = carry(values, argument.into())?;
+            // A native CLI treats backslashes before the closing quote as escapes.
+            let trailing = argument.len() - argument.trim_end_matches('\\').len();
+            let quoted_value = format!("{argument}{}", "\\".repeat(trailing));
+            let name = carry(values, quoted_value.into())?;
             command.push_str(&format!(" \"%%{name}%%\""));
         }
     }
@@ -344,11 +389,30 @@ fn powershell_literal(value: &str) -> String {
 
 // A profile can shadow cmdlets such as Remove-Item, but not .NET methods.
 fn powershell_clear_env(names: impl Iterator<Item = &'static str>) -> String {
-    let names: Vec<_> = names.map(|name| format!("'{name}'")).collect();
-    format!(
+    let mut clear_values = false;
+    let names: Vec<_> = names
+        .filter(|name| {
+            if name.starts_with("CC_SWITCH_INTERNAL_VALUE_") {
+                clear_values = true;
+                false
+            } else {
+                true
+            }
+        })
+        .map(|name| format!("'{name}'"))
+        .collect();
+    let mut script = format!(
         "foreach($n in {}){{[Environment]::SetEnvironmentVariable($n,$null)}}",
         names.join(",")
-    )
+    );
+    // Keep the encoded payload short instead of listing every carrier name twice.
+    if clear_values {
+        script.push_str(&format!(
+            "; for($i=0;$i -lt {};$i++){{[Environment]::SetEnvironmentVariable(('CC_SWITCH_INTERNAL_VALUE_'+$i),$null)}}",
+            VALUE_ENV_VARS.len()
+        ));
+    }
+    script
 }
 
 /// Binds this launch's values inside the payload. WT expands `%VAR%` in its
@@ -357,9 +421,10 @@ fn powershell_clear_env(names: impl Iterator<Item = &'static str>) -> String {
 /// `%`, and no `;` for WT to split commands at.
 pub(super) fn powershell_payload(launch: &BatchLaunch) -> io::Result<String> {
     let cmd = powershell_literal(&system_cmd_path()?.to_string_lossy());
-    let bind: String = launch
+    let mut bind: String = launch
         .env()
         .into_iter()
+        .filter(|(name, _)| matches!(*name, BATCH_PATH_ENV | CWD_ENV))
         .map(|(name, value)| {
             format!(
                 "$env:{name}={}; ",
@@ -367,6 +432,16 @@ pub(super) fn powershell_payload(launch: &BatchLaunch) -> io::Result<String> {
             )
         })
         .collect();
+    // List the values once; repeating their long variable names can exceed CMD's limit.
+    let values = launch
+        .values
+        .iter()
+        .map(|value| powershell_literal(&value.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(",");
+    bind.push_str(&format!(
+        "$v=@({values}); for($i=0;$i -lt $v.Count;$i++){{[Environment]::SetEnvironmentVariable(('CC_SWITCH_INTERNAL_VALUE_'+$i),$v[$i])}}; "
+    ));
     Ok(format!(
         "& {{ $ErrorActionPreference='Stop'; {}; {bind}try {{ & {cmd} /D /E:ON /V:OFF /C '{RUN_AND_DELETE_BATCH}' }} finally {{ {} }} }}",
         powershell_clear_env(inherited_env_to_clear()),
@@ -379,7 +454,7 @@ pub(super) fn powershell_payload(launch: &BatchLaunch) -> io::Result<String> {
 /// child cannot change its parent's environment.
 fn wt_cmd_bootstrap(payload: &str) -> io::Result<String> {
     let clear: String = inherited_env_to_clear()
-        .map(|name| format!("set \"{name}=\" & "))
+        .map(|name| format!("set {name}=&"))
         .collect();
     // One argument under CMD /S keeps the quotes around the absolute path.
     let bootstrap = format!(
@@ -1109,6 +1184,7 @@ fn main() {
         CmdKeepOpen,
         CmdKeepOpenEmptyTitle,
         PowerShell,
+        WtCmd,
     }
 
     /// Runs `launch` as its terminal would, with a hidden console. A /K CMD then
@@ -1120,6 +1196,18 @@ fn main() {
         extra: &[(&str, &OsString)],
     ) -> Output {
         let mut command = match runner {
+            Runner::WtCmd => {
+                let profile = WtDefaultProfile {
+                    selector: "{22222222-2222-4222-8222-222222222222}".into(),
+                    shell: WtDefaultShell::Cmd,
+                };
+                let args = wt_new_tab_args(Some(&profile), launch).unwrap();
+                let appended = &args[args.iter().position(|arg| arg == "--").unwrap() + 1..];
+                let mut command = Command::new(system_cmd_path().unwrap());
+                configure_shell_env(&mut command, &prepend_path(bin));
+                command.raw_arg(wt_appended_command_line(appended));
+                command
+            }
             Runner::PowerShell => {
                 let script = format!(
                     "{}; $code = $LASTEXITCODE; [IO.File]::WriteAllText($env:CC_SWITCH_TEST_PARENT_MARKER, 'parent-resumed'); exit $code",
@@ -1460,6 +1548,111 @@ fn main() {
     }
 
     #[test]
+    fn provider_batch_carries_codex_overrides_and_all_user_args() {
+        let temp = tempfile::tempdir().unwrap();
+        let exe_bin = temp.path().join("exe");
+        let shim_bin = temp.path().join("shim");
+        std::fs::create_dir(&exe_bin).unwrap();
+        std::fs::create_dir(&shim_bin).unwrap();
+        compile(
+            r#"fn main() {
+                let mut record = String::new();
+                for arg in std::env::args().skip(1) {
+                    record.push_str(&format!("arg={arg}\n"));
+                }
+                for name in ["CODEX_HOME", "CC_SWITCH_CODEX_API_KEY"] {
+                    record.push_str(&format!("{name}={}\n", std::env::var(name).unwrap()));
+                }
+                std::fs::write(std::env::var_os("CC_SWITCH_TEST_RECORD").unwrap(), record).unwrap();
+            }"#,
+            &exe_bin.join("codex.exe"),
+        );
+        std::fs::copy(exe_bin.join("codex.exe"), shim_bin.join("probe.exe")).unwrap();
+        std::fs::write(
+            shim_bin.join("codex.cmd"),
+            "@echo off\r\n\"%~dp0probe.exe\" %*\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+        let mut args = Vec::new();
+        for index in 0..24 {
+            args.extend(["-c".to_string(), format!("setting{index}='模型{index}'")]);
+        }
+        args.push("--dangerously-bypass-approvals-and-sandbox".into());
+        args.extend((0..13).map(|index| format!("附加{index} & | ; (value)")));
+        args.extend(["C:\\work dir\\".into(), "\\\\".into(), String::new()]);
+        let catalog = temp.path().join("模型目录.json");
+        let home = temp.path().join("用户目录");
+        let record = temp.path().join("record.txt");
+        let parent = temp.path().join("parent.txt");
+        let batch = temp.path().join("启动.bat");
+        let provider = ProviderLaunch {
+            title: "Codex test",
+            detail: None,
+            program: "codex",
+            args,
+            env: vec![
+                ("CODEX_HOME", Some(home.to_string_lossy().into_owned())),
+                ("CC_SWITCH_CODEX_API_KEY", Some("test-only-key".into())),
+            ],
+            cleanup: vec![catalog.clone()],
+        };
+        let expected = format!(
+            "{}CODEX_HOME={}\nCC_SWITCH_CODEX_API_KEY=test-only-key\n",
+            provider
+                .args
+                .iter()
+                .map(|arg| format!("arg={arg}\n"))
+                .collect::<String>(),
+            home.display()
+        );
+        for bin in [&exe_bin, &shim_bin] {
+            for runner in [Runner::Cmd, Runner::PowerShell, Runner::WtCmd] {
+                std::fs::write(&catalog, "{}").unwrap();
+                let mut values = Vec::new();
+                let content = provider_batch(&provider, &mut values).unwrap();
+                assert!(content.is_ascii());
+                assert!(values.len() > 6, "exercise the expanded carrier capacity");
+                assert!(!values.iter().any(|value| value == "test-only-key"));
+                std::fs::write(&batch, content).unwrap();
+                let launch = BatchLaunch {
+                    batch: &batch,
+                    cwd: None,
+                    values,
+                };
+                let profile = WtDefaultProfile {
+                    selector: "{22222222-2222-4222-8222-222222222222}".into(),
+                    shell: WtDefaultShell::Cmd,
+                };
+                let tab_args = wt_new_tab_args(Some(&profile), &launch).unwrap();
+                let appended =
+                    &tab_args[tab_args.iter().position(|arg| arg == "--").unwrap() + 1..];
+                assert!(wt_appended_command_line(appended).encode_utf16().count() < 8191);
+                let output = run_batch(
+                    runner,
+                    &launch,
+                    bin,
+                    &[
+                        ("CC_SWITCH_TEST_RECORD", &record.clone().into_os_string()),
+                        (
+                            "CC_SWITCH_TEST_PARENT_MARKER",
+                            &parent.clone().into_os_string(),
+                        ),
+                    ],
+                );
+                assert!(output.status.success(), "{runner:?}: {output:?}");
+                assert_eq!(
+                    std::fs::read_to_string(&record).unwrap(),
+                    expected,
+                    "{runner:?}"
+                );
+                std::fs::remove_file(&record).unwrap();
+                assert!(!catalog.exists());
+                assert!(!batch.exists());
+            }
+        }
+    }
+
+    #[test]
     fn provider_batch_refuses_values_cmd_cannot_carry() {
         let launch = |args: Vec<String>, env: Vec<(&'static str, Option<String>)>| ProviderLaunch {
             title: "test",
@@ -1622,9 +1815,16 @@ fn main() {
         let probe = format!(
             "@echo off\r\nset \"CC_SWITCH_INTERNAL_BATCH_PATH=\"\r\n{probe}cd /d \"%CC_SWITCH_INTERNAL_CWD%\" || exit /b 5\r\n> \"%CC_SWITCH_INTERNAL_VALUE_0%\" echo ran\r\n> cwd.txt echo ok\r\n"
         );
-        let leak_check: String = inherited_env_to_clear()
+        let mut leak_check: String = PARENT_CLAUDE_SESSION_ENV_VARS
+            .into_iter()
+            .chain([BATCH_PATH_ENV, CWD_ENV])
             .map(|name| format!(" & if defined {name} echo cc-switch-leak-{name}"))
             .collect();
+        // The probe itself must not exceed CMD's limit as the carrier pool grows.
+        leak_check.push_str(&format!(
+            " & for /L %i in (0,1,{}) do @if defined CC_SWITCH_INTERNAL_VALUE_%i echo cc-switch-leak-%i",
+            VALUE_ENV_VARS.len() - 1
+        ));
         let cmd = system_cmd_path().unwrap();
         let powershell = system_powershell_path().unwrap();
         let pwsh = std::env::split_paths(&std::env::var_os("PATH").unwrap())
