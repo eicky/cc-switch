@@ -72,12 +72,16 @@ fn system_directory() -> io::Result<PathBuf> {
 }
 
 fn console_executable(program: &OsStr) -> io::Result<PathBuf> {
+    let path = Path::new(program);
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
     let relative = match program.to_str() {
         Some("cmd") => "cmd.exe",
         Some("powershell") => "WindowsPowerShell/v1.0/powershell.exe",
         _ => {
             return Err(invalid_input(
-                "new console supports only the system cmd and PowerShell",
+                "new console requires system cmd/PowerShell or an absolute executable path",
             ))
         }
     };

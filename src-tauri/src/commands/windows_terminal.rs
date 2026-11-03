@@ -362,9 +362,19 @@ fn spawn_cmd_console(launch: &BatchLaunch, path: &str) -> Result<(), String> {
     spawn_new_console(&mut command).map_err(|e| format!("启动 cmd 失败: {e}"))
 }
 
+/// Prefer PowerShell 7 on the restored PATH, including Store execution aliases.
+/// Keep the selected path explicit so CreateProcessW does not search the parent cwd.
+fn windows_powershell_program(path: &str) -> io::Result<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join("pwsh.exe"))
+        .find(|candidate| std::fs::symlink_metadata(candidate).is_ok())
+        .map_or_else(system_powershell_path, std::path::absolute)
+}
+
 fn spawn_powershell_console(launch: &BatchLaunch, path: &str) -> io::Result<()> {
     let payload = powershell_encoded_command(&powershell_payload(launch)?);
-    let mut command = Command::new("powershell");
+    let mut command = Command::new(windows_powershell_program(path)?);
     configure_shell_env(&mut command, path);
     command.args(["-NoExit", "-EncodedCommand", &payload]);
     if let Some(cwd) = launch.drive_cwd() {
@@ -896,6 +906,79 @@ mod tests {
     use super::super::misc::decode_command_output;
     use super::*;
     use std::process::{Output, Stdio};
+
+    #[test]
+    fn windows_powershell_program_prefers_pwsh_on_path() {
+        let root = tempfile::tempdir().unwrap();
+        let empty = root.path().join("empty");
+        let pwsh_dir = root.path().join("PowerShell 7");
+        let later = root.path().join("later");
+        for directory in [&empty, &pwsh_dir, &later] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        for directory in [&pwsh_dir, &later] {
+            std::fs::write(directory.join("pwsh.exe"), "").unwrap();
+        }
+
+        let fallback = system_powershell_path().unwrap();
+        assert_eq!(windows_powershell_program("").unwrap(), fallback);
+        assert_eq!(
+            windows_powershell_program(empty.to_str().unwrap()).unwrap(),
+            fallback
+        );
+        let path = std::env::join_paths([&empty, &pwsh_dir, &later]).unwrap();
+        assert_eq!(
+            windows_powershell_program(path.to_str().unwrap()).unwrap(),
+            pwsh_dir.join("pwsh.exe")
+        );
+    }
+
+    #[test]
+    fn powershell_console_launches_the_resolved_pwsh_with_console_streams() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("PowerShell 7 中文 & tools");
+        std::fs::create_dir(&directory).unwrap();
+        let executable = directory.join("pwsh.exe");
+        compile(
+            r#"
+use std::io::IsTerminal;
+fn main() {
+    assert!(std::io::stdin().is_terminal());
+    assert!(std::io::stdout().is_terminal());
+    assert!(std::io::stderr().is_terminal());
+    for name in ["CLAUDECODE", "NO_COLOR", "NODE_DISABLE_COLORS"] {
+        assert!(std::env::var_os(name).is_none());
+    }
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    std::fs::write("pwsh-result.txt", args.join("\n")).unwrap();
+}
+"#,
+            &executable,
+        );
+        let batch = directory.join("launch.bat");
+        let launch = BatchLaunch {
+            batch: &batch,
+            cwd: Some(&directory),
+            values: Vec::new(),
+        };
+        let expected = format!(
+            "-NoExit\n-EncodedCommand\n{}",
+            powershell_encoded_command(&powershell_payload(&launch).unwrap())
+        );
+        spawn_powershell_console(&launch, directory.to_str().unwrap()).unwrap();
+        let record = directory.join("pwsh-result.txt");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while std::fs::read_to_string(&record).ok().as_deref() != Some(&expected) {
+            assert!(
+                Instant::now() < deadline,
+                "resolved pwsh did not record the launch"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        wait_until("pwsh probe exit", || {
+            std::fs::remove_file(&executable).is_ok()
+        });
+    }
 
     struct EnvRestore(Vec<(String, Option<OsString>)>);
 
